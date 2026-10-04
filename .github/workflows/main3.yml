@@ -1,1 +1,287 @@
-name: Cloud Gaming PC Setupon:  workflow_dispatch:    inputs:      install_steam:        description: Install Steam        required: true        default: true        type: boolean      idle_shutdown_minutes:        description: Minutes before idle shutdown; use 0 to disable        required: true        default: 30        type: number      parsec_assignment:        description: Parsec Team computer assignment        required: true        default: user_email        type: choice        options:          - user_email          - unassigned          - user_id          - team_group      guest_access:        description: Enable Parsec Guest Access        required: true        default: false        type: boolean      enable_auto_login:        description: Enable Windows auto-login        required: true        default: false        type: boolean  push:    branches:      - main    paths:      - Cloud-Gaming-PC-Setup.ps1      - .github/workflows/cloud-gaming-pc.yml  pull_request:    paths:      - Cloud-Gaming-PC-Setup.ps1      - .github/workflows/cloud-gaming-pc.ymlpermissions:  contents: readconcurrency:  group: cloud-gaming-setup-${{ github.repository }}-${{ github.ref }}  cancel-in-progress: falsejobs:  validate:    name: Validate PowerShell    runs-on: windows-latest    timeout-minutes: 10    steps:      - name: Checkout repository        uses: actions/checkout@v7      - name: Parse PowerShell script        shell: pwsh        run: |          $ErrorActionPreference = "Stop"          $scriptPath = Join-Path $env:GITHUB_WORKSPACE "Cloud-Gaming-PC-Setup.ps1"          if (-not (Test-Path -LiteralPath $scriptPath)) {            throw "Setup script was not found: $scriptPath"          }          $tokens = $null          $parseErrors = $null          [void][System.Management.Automation.Language.Parser]::ParseFile(            $scriptPath,            [ref]$tokens,            [ref]$parseErrors          )          if ($parseErrors.Count -gt 0) {            $parseErrors | ForEach-Object {              Write-Host "::error file=Cloud-Gaming-PC-Setup.ps1,line=$($_.Extent.StartLineNumber),col=$($_.Extent.StartColumnNumber)::$($_.Message)"            }            throw "PowerShell syntax validation failed."          }          Write-Host "PowerShell syntax validation passed."  setup:    name: Configure GPU gaming PC    needs: validate    if: github.event_name == 'workflow_dispatch'    runs-on:      - self-hosted      - windows      - gpu    environment: cloud-gaming    timeout-minutes: 60    env:      PARSEC_TEAM_ID: ${{ secrets.PARSEC_TEAM_ID }}      PARSEC_TEAM_COMPUTER_KEY: ${{ secrets.PARSEC_TEAM_COMPUTER_KEY }}      PARSEC_USER_EMAIL: ${{ secrets.PARSEC_USER_EMAIL }}      PARSEC_USER_ID: ${{ secrets.PARSEC_USER_ID }}      PARSEC_TEAM_GROUP_ID: ${{ secrets.PARSEC_TEAM_GROUP_ID }}      AUTO_LOGIN_USER: ${{ secrets.AUTO_LOGIN_USER }}      AUTO_LOGIN_PASSWORD: ${{ secrets.AUTO_LOGIN_PASSWORD }}    steps:      - name: Checkout repository        uses: actions/checkout@v7      - name: Validate runner and secrets        shell: pwsh        run: |          $ErrorActionPreference = "Stop"          $requiredSecrets = @(            "PARSEC_TEAM_ID",            "PARSEC_TEAM_COMPUTER_KEY"          )          $assignment = '${{ inputs.parsec_assignment }}'          switch ($assignment) {            "user_email" { $requiredSecrets += "PARSEC_USER_EMAIL" }            "user_id"    { $requiredSecrets += "PARSEC_USER_ID" }            "team_group" { $requiredSecrets += "PARSEC_TEAM_GROUP_ID" }          }          $missing = [System.Collections.Generic.List[string]]::new()          foreach ($name in $requiredSecrets) {            $value = [Environment]::GetEnvironmentVariable($name)            if ([string]::IsNullOrWhiteSpace($value)) {              [void]$missing.Add($name)            }            else {              Write-Host "::add-mask::$value"            }          }          if ($missing.Count -gt 0) {            throw "Missing required GitHub environment secrets: $($missing -join ', ')"          }          if ($assignment -eq "user_id" -and $env:PARSEC_USER_ID -notmatch '^\d+$') {            throw "PARSEC_USER_ID must contain digits only."          }          if ($assignment -eq "team_group" -and $env:PARSEC_TEAM_GROUP_ID -notmatch '^\d+$') {            throw "PARSEC_TEAM_GROUP_ID must contain digits only."          }          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()          $principal = [Security.Principal.WindowsPrincipal]::new($identity)          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {            throw "The self-hosted runner must run with administrator privileges."          }          $nvidiaSmi = Get-Command "nvidia-smi.exe" -ErrorAction SilentlyContinue          if (-not $nvidiaSmi) {            $defaultPath = "C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"            if (Test-Path -LiteralPath $defaultPath) {              $nvidiaSmi = [pscustomobject]@{ Source = $defaultPath }            }          }          if (-not $nvidiaSmi) {            throw "No NVIDIA driver was found. Install the GPU driver on this runner before running setup."          }          & $nvidiaSmi.Source --query-gpu=name,driver_version --format=csv,noheader          if ($LASTEXITCODE -ne 0) {            throw "nvidia-smi failed with exit code $LASTEXITCODE."          }          Write-Host "Runner validation passed."      - name: Run cloud gaming setup        shell: pwsh        run: |          $ErrorActionPreference = "Stop"          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force          $scriptPath = Join-Path $env:GITHUB_WORKSPACE "Cloud-Gaming-PC-Setup.ps1"          if (-not (Test-Path -LiteralPath $scriptPath)) {            throw "Setup script was not found: $scriptPath"          }          $setupParameters = @{            IdleShutdownMinutes = [int]'${{ inputs.idle_shutdown_minutes }}'            RequireGpu = $true            ParsecTeamId = $env:PARSEC_TEAM_ID.Trim()            ParsecTeamComputerKey = $env:PARSEC_TEAM_COMPUTER_KEY.Trim()            ParsecGuestAccess = "0"          }          if ('${{ inputs.guest_access }}' -eq 'true') {            $setupParameters["ParsecGuestAccess"] = "1"          }          if ('${{ inputs.install_steam }}' -eq 'false') {            $setupParameters["SkipSteam"] = $true          }          switch ('${{ inputs.parsec_assignment }}') {            "user_email" {              $setupParameters["ParsecUserEmail"] = $env:PARSEC_USER_EMAIL.Trim()            }            "user_id" {              $setupParameters["ParsecUserId"] = [int]$env:PARSEC_USER_ID            }            "team_group" {              $setupParameters["ParsecTeamGroupId"] = [int]$env:PARSEC_TEAM_GROUP_ID            }          }          if ('${{ inputs.enable_auto_login }}' -eq 'true') {            if ([string]::IsNullOrWhiteSpace($env:AUTO_LOGIN_USER) -or                [string]::IsNullOrWhiteSpace($env:AUTO_LOGIN_PASSWORD)) {              throw "AUTO_LOGIN_USER and AUTO_LOGIN_PASSWORD secrets are required when auto-login is enabled."            }            Write-Host "::add-mask::$env:AUTO_LOGIN_USER"            Write-Host "::add-mask::$env:AUTO_LOGIN_PASSWORD"            $setupParameters["AutoLoginUser"] = $env:AUTO_LOGIN_USER            $setupParameters["AutoLoginPass"] = ConvertTo-SecureString $env:AUTO_LOGIN_PASSWORD -AsPlainText -Force          }          & $scriptPath @setupParameters      - name: Verify installation        shell: pwsh        run: |          $ErrorActionPreference = "Stop"          $parsecExe = "C:\Program Files\Parsec\parsecd.exe"          if (-not (Test-Path -LiteralPath $parsecExe)) {            throw "Parsec executable was not found after setup."          }          $deadline = (Get-Date).AddMinutes(2)          $service = $null          while ((Get-Date) -lt $deadline) {            $service = Get-Service -Name "Parsec" -ErrorAction SilentlyContinue            if ($service -and $service.Status -eq "Running") { break }            Start-Sleep -Seconds 5          }          if (-not $service) {            throw "Parsec service was not found after setup."          }          if ($service.Status -ne "Running") {            throw "Parsec service exists but is not running. Current state: $($service.Status)"          }          $authFile = "C:\ProgramData\Parsec\user.bin"          if (-not (Test-Path -LiteralPath $authFile)) {            throw "Parsec Team authentication file was not created: $authFile"          }          if ('${{ inputs.install_steam }}' -eq 'true') {            $steamExe = "C:\Program Files (x86)\Steam\steam.exe"            if (-not (Test-Path -LiteralPath $steamExe)) {              throw "Steam executable was not found after setup."            }          }          $nvidiaSmi = "C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"          $gpuSummary = "Unavailable"          if (Test-Path -LiteralPath $nvidiaSmi) {            $gpuSummary = (& $nvidiaSmi --query-gpu=name,driver_version --format=csv,noheader | Select-Object -First 1)          }          $summary = @(            "## Cloud gaming PC setup complete",            "",            "- Runner: ``$env:COMPUTERNAME``",            "- GPU: ``$gpuSummary``",            "- Parsec service: ``$($service.Status)``",            "- Parsec assignment mode: ``${{ inputs.parsec_assignment }}``",            "- Idle shutdown minutes: ``${{ inputs.idle_shutdown_minutes }}``",            "",            "Confirm that the machine appears in the Parsec Team admin portal before connecting."          )          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8          Write-Host "Installation verification passed."
+name: Cloud Gaming PC Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      install_steam:
+        description: Install Steam
+        required: true
+        default: true
+        type: boolean
+      idle_shutdown_minutes:
+        description: Minutes before idle shutdown; use 0 to disable
+        required: true
+        default: 30
+        type: number
+      parsec_assignment:
+        description: Parsec Team computer assignment
+        required: true
+        default: user_email
+        type: choice
+        options:
+          - user_email
+          - unassigned
+          - user_id
+          - team_group
+      guest_access:
+        description: Enable Parsec Guest Access
+        required: true
+        default: false
+        type: boolean
+      enable_auto_login:
+        description: Enable Windows auto-login
+        required: true
+        default: false
+        type: boolean
+  push:
+    branches:
+      - main
+    paths:
+      - Cloud-Gaming-PC-Setup.ps1
+      - .github/workflows/cloud-gaming-pc.yml
+  pull_request:
+    paths:
+      - Cloud-Gaming-PC-Setup.ps1
+      - .github/workflows/cloud-gaming-pc.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-gaming-setup-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate PowerShell
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Parse PowerShell script
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $scriptPath = Join-Path $env:GITHUB_WORKSPACE "Cloud-Gaming-PC-Setup.ps1"
+          if (-not (Test-Path -LiteralPath $scriptPath)) {
+            throw "Setup script was not found: $scriptPath"
+          }
+
+          $tokens = $null
+          $parseErrors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            $scriptPath,
+            [ref]$tokens,
+            [ref]$parseErrors
+          )
+
+          if ($parseErrors.Count -gt 0) {
+            $parseErrors | ForEach-Object {
+              Write-Host "::error file=Cloud-Gaming-PC-Setup.ps1,line=$($_.Extent.StartLineNumber),col=$($_.Extent.StartColumnNumber)::$($_.Message)"
+            }
+            throw "PowerShell syntax validation failed."
+          }
+
+          Write-Host "PowerShell syntax validation passed."
+
+  setup:
+    name: Configure GPU gaming PC
+    needs: validate
+    if: github.event_name == 'workflow_dispatch'
+    runs-on:
+      - self-hosted
+      - windows
+      - gpu
+    environment: cloud-gaming
+    timeout-minutes: 60
+
+    env:
+      PARSEC_TEAM_ID: ${{ secrets.PARSEC_TEAM_ID }}
+      PARSEC_TEAM_COMPUTER_KEY: ${{ secrets.PARSEC_TEAM_COMPUTER_KEY }}
+      PARSEC_USER_EMAIL: ${{ secrets.PARSEC_USER_EMAIL }}
+      PARSEC_USER_ID: ${{ secrets.PARSEC_USER_ID }}
+      PARSEC_TEAM_GROUP_ID: ${{ secrets.PARSEC_TEAM_GROUP_ID }}
+      AUTO_LOGIN_USER: ${{ secrets.AUTO_LOGIN_USER }}
+      AUTO_LOGIN_PASSWORD: ${{ secrets.AUTO_LOGIN_PASSWORD }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Validate runner and secrets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $requiredSecrets = @(
+            "PARSEC_TEAM_ID",
+            "PARSEC_TEAM_COMPUTER_KEY"
+          )
+
+          $assignment = '${{ inputs.parsec_assignment }}'
+          switch ($assignment) {
+            "user_email" { $requiredSecrets += "PARSEC_USER_EMAIL" }
+            "user_id"    { $requiredSecrets += "PARSEC_USER_ID" }
+            "team_group" { $requiredSecrets += "PARSEC_TEAM_GROUP_ID" }
+          }
+
+          $missing = [System.Collections.Generic.List[string]]::new()
+          foreach ($name in $requiredSecrets) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ([string]::IsNullOrWhiteSpace($value)) {
+              [void]$missing.Add($name)
+            }
+            else {
+              Write-Host "::add-mask::$value"
+            }
+          }
+
+          if ($missing.Count -gt 0) {
+            throw "Missing required GitHub environment secrets: $($missing -join ', ')"
+          }
+
+          if ($assignment -eq "user_id" -and $env:PARSEC_USER_ID -notmatch '^\d+$') {
+            throw "PARSEC_USER_ID must contain digits only."
+          }
+          if ($assignment -eq "team_group" -and $env:PARSEC_TEAM_GROUP_ID -notmatch '^\d+$') {
+            throw "PARSEC_TEAM_GROUP_ID must contain digits only."
+          }
+
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw "The self-hosted runner must run with administrator privileges."
+          }
+
+          $nvidiaSmi = Get-Command "nvidia-smi.exe" -ErrorAction SilentlyContinue
+          if (-not $nvidiaSmi) {
+            $defaultPath = "C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+            if (Test-Path -LiteralPath $defaultPath) {
+              $nvidiaSmi = [pscustomobject]@{ Source = $defaultPath }
+            }
+          }
+
+          if (-not $nvidiaSmi) {
+            throw "No NVIDIA driver was found. Install the GPU driver on this runner before running setup."
+          }
+
+          & $nvidiaSmi.Source --query-gpu=name,driver_version --format=csv,noheader
+          if ($LASTEXITCODE -ne 0) {
+            throw "nvidia-smi failed with exit code $LASTEXITCODE."
+          }
+
+          Write-Host "Runner validation passed."
+
+      - name: Run cloud gaming setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+
+          $scriptPath = Join-Path $env:GITHUB_WORKSPACE "Cloud-Gaming-PC-Setup.ps1"
+          if (-not (Test-Path -LiteralPath $scriptPath)) {
+            throw "Setup script was not found: $scriptPath"
+          }
+
+          $setupParameters = @{
+            IdleShutdownMinutes = [int]'${{ inputs.idle_shutdown_minutes }}'
+            RequireGpu = $true
+            ParsecTeamId = $env:PARSEC_TEAM_ID.Trim()
+            ParsecTeamComputerKey = $env:PARSEC_TEAM_COMPUTER_KEY.Trim()
+            ParsecGuestAccess = "0"
+          }
+
+          if ('${{ inputs.guest_access }}' -eq 'true') {
+            $setupParameters["ParsecGuestAccess"] = "1"
+          }
+
+          if ('${{ inputs.install_steam }}' -eq 'false') {
+            $setupParameters["SkipSteam"] = $true
+          }
+
+          switch ('${{ inputs.parsec_assignment }}') {
+            "user_email" {
+              $setupParameters["ParsecUserEmail"] = $env:PARSEC_USER_EMAIL.Trim()
+            }
+            "user_id" {
+              $setupParameters["ParsecUserId"] = [int]$env:PARSEC_USER_ID
+            }
+            "team_group" {
+              $setupParameters["ParsecTeamGroupId"] = [int]$env:PARSEC_TEAM_GROUP_ID
+            }
+          }
+
+          if ('${{ inputs.enable_auto_login }}' -eq 'true') {
+            if ([string]::IsNullOrWhiteSpace($env:AUTO_LOGIN_USER) -or
+                [string]::IsNullOrWhiteSpace($env:AUTO_LOGIN_PASSWORD)) {
+              throw "AUTO_LOGIN_USER and AUTO_LOGIN_PASSWORD secrets are required when auto-login is enabled."
+            }
+
+            Write-Host "::add-mask::$env:AUTO_LOGIN_USER"
+            Write-Host "::add-mask::$env:AUTO_LOGIN_PASSWORD"
+            $setupParameters["AutoLoginUser"] = $env:AUTO_LOGIN_USER
+            $setupParameters["AutoLoginPass"] = ConvertTo-SecureString $env:AUTO_LOGIN_PASSWORD -AsPlainText -Force
+          }
+
+          & $scriptPath @setupParameters
+
+      - name: Verify installation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $parsecExe = "C:\Program Files\Parsec\parsecd.exe"
+          if (-not (Test-Path -LiteralPath $parsecExe)) {
+            throw "Parsec executable was not found after setup."
+          }
+
+          $deadline = (Get-Date).AddMinutes(2)
+          $service = $null
+          while ((Get-Date) -lt $deadline) {
+            $service = Get-Service -Name "Parsec" -ErrorAction SilentlyContinue
+            if ($service -and $service.Status -eq "Running") { break }
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $service) {
+            throw "Parsec service was not found after setup."
+          }
+          if ($service.Status -ne "Running") {
+            throw "Parsec service exists but is not running. Current state: $($service.Status)"
+          }
+
+          $authFile = "C:\ProgramData\Parsec\user.bin"
+          if (-not (Test-Path -LiteralPath $authFile)) {
+            throw "Parsec Team authentication file was not created: $authFile"
+          }
+
+          if ('${{ inputs.install_steam }}' -eq 'true') {
+            $steamExe = "C:\Program Files (x86)\Steam\steam.exe"
+            if (-not (Test-Path -LiteralPath $steamExe)) {
+              throw "Steam executable was not found after setup."
+            }
+          }
+
+          $nvidiaSmi = "C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+          $gpuSummary = "Unavailable"
+          if (Test-Path -LiteralPath $nvidiaSmi) {
+            $gpuSummary = (& $nvidiaSmi --query-gpu=name,driver_version --format=csv,noheader | Select-Object -First 1)
+          }
+
+          $summary = @(
+            "## Cloud gaming PC setup complete",
+            "",
+            "- Runner: ``$env:COMPUTERNAME``",
+            "- GPU: ``$gpuSummary``",
+            "- Parsec service: ``$($service.Status)``",
+            "- Parsec assignment mode: ``${{ inputs.parsec_assignment }}``",
+            "- Idle shutdown minutes: ``${{ inputs.idle_shutdown_minutes }}``",
+            "",
+            "Confirm that the machine appears in the Parsec Team admin portal before connecting."
+          )
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+          Write-Host "Installation verification passed."
